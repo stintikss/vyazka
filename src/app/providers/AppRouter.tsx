@@ -4,6 +4,7 @@ import Calculations from '../../pages/Calculations/Calculations';
 
 export const AppRouter = () => (
     <Routes>
+        <Route path="/" element={<Navigate to="/home" replace />} />
         <Route path="/home" element={<HomePage />} />
         <Route path="/calculation" element={<Calculations />} />
         <Route path="*" element={<Navigate to="/home" replace />} />
