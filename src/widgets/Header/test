@@ -1,0 +1,1762 @@
+// ==UserScript==
+// @name         UNU Task Opener (Cmd+K / Cmd+U / Cmd+M / Buttons)
+// @namespace    http://tampermonkey.net/
+// @version      2.13
+// @description  Cmd+K — все задания с таймером, Cmd+U — соцсети 60 сек, Cmd+M — поминутные, кнопки для запуска и часовые с вводом числа часов (поддержка нескольких через пробел)
+// @author       You
+// @match        https://unu.im/tasks/works*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    window.UNU_STATE = window.UNU_STATE || {
+        openedLinks: new Set(),
+        openingStopped: true,
+        currentlyOpening: false,
+        socialOnly: false,
+        minuteOnly: false,
+        hourlyOnly: false,
+        targetHours: [], // изменено с одного числа на массив
+        timer: null,
+        remainingTime: 0,
+        startTime: 0,
+        lastOpenedHourlyCounts: {}, // добавлено для хранения количества открытых по каждому часу
+        lastOpenedHourlyHours: [], // какие часы были в последнем открытии
+        prevOpenedHourlyCounts: {}, // предыдущее открытие (кол-ва)
+        prevOpenedHourlyHours: []  // предыдущее открытие (часы)
+    };
+
+    const socialKeywords = [
+        "whatsapp", "facebook", "likee", "нфби", "послушать", "бота",
+        "озон", "ozon", "wb", "wildbiries", "вб", "найти и перейти на карточку организации",
+        "twitter", "доброго времени суток!", "watsaap", "ватсап", "whatsap", "whatsapp"
+    ];
+
+    // Глобальный div для последних открытых часов
+    let lastOpenedHoursDiv = null;
+    function updateLastOpenedHours(hoursArr, hourlyCounts, isNew = false) {
+        if (lastOpenedHoursDiv) {
+            if (Array.isArray(hoursArr) && hoursArr.length > 0) {
+                let text = '';
+                let total = 0;
+                if (isNew) {
+                    text += `Открыто новое: ${hoursArr.map(h => `${h}-${hourlyCounts[h] || 0}`).join(' ')}`;
+                    total += hoursArr.reduce((sum, h) => sum + (hourlyCounts[h] || 0), 0);
+                    // показать "Ранее" если есть
+                    if (window.UNU_STATE.prevOpenedHourlyHours && window.UNU_STATE.prevOpenedHourlyHours.length > 0) {
+                        text += `\nРанее: ${window.UNU_STATE.prevOpenedHourlyHours.map(h => `${h}-${window.UNU_STATE.prevOpenedHourlyCounts[h] || 0}`).join(' ')}`;
+                        total += window.UNU_STATE.prevOpenedHourlyHours.reduce((sum, h) => sum + (window.UNU_STATE.prevOpenedHourlyCounts[h] || 0), 0);
+                    }
+                    text += ` общее: ${total}`;
+                } else {
+                    text += `Последние открытые: ${hoursArr.join(' ')}`;
+                    if (hourlyCounts && typeof hourlyCounts === 'object' && Object.keys(hourlyCounts).length > 0) {
+                        text += ' ' + hoursArr.map(h => `${h}-${hourlyCounts[h] || 0}`).join(' ');
+                        total += hoursArr.reduce((sum, h) => sum + (hourlyCounts[h] || 0), 0);
+                    }
+                    text += ` общее: ${total}`;
+                }
+                lastOpenedHoursDiv.textContent = text;
+            } else {
+                lastOpenedHoursDiv.textContent = "Последние открытые: -";
+            }
+        }
+    }
+
+    if (window.location.href.includes("/tasks/works")) {
+        setupUI();
+        highlightJobs();
+        applyTheme(localStorage.getItem("theme") || "light");
+        observeDOM();
+
+        // === Сумма всех .sum на странице ===
+        function sumAllJobSums() {
+            const sumEls = document.querySelectorAll('.job-table__row .sum');
+            let total = 0;
+            sumEls.forEach(el => {
+                const val = parseFloat((el.textContent || '').replace(/[^\d.,]/g, '').replace(',', '.'));
+                if (!isNaN(val)) total += val;
+            });
+            console.log('[UNU] Сумма всех выплат на странице:', total.toFixed(2));
+            return total;
+        }
+
+        // UI счетчик для суммы
+        const sumCounter = document.createElement('div');
+        sumCounter.style.gridColumn = '1 / span 2';
+        sumCounter.style.textAlign = 'center';
+        sumCounter.style.fontWeight = 'bold';
+        sumCounter.style.background = '#e6fff3';
+        sumCounter.style.marginTop = '-2px';
+        sumCounter.style.marginBottom = '-2px';
+        sumCounter.style.fontSize = '15px';
+        sumCounter.style.color = '#009688';
+        sumCounter.textContent = 'Сумма выплат: ...';
+        // Вставляем после counterDiff
+        const ui = document.getElementById('unu-task-opener-ui');
+        if (ui) {
+            const idx = Array.from(ui.children).indexOf(ui.querySelector('div[style*="b800ff"]'));
+            if (idx >= 0 && idx < ui.children.length - 1) {
+                ui.insertBefore(sumCounter, ui.children[idx + 1]);
+            } else {
+                ui.appendChild(sumCounter);
+            }
+        }
+
+        // Обновлять сумму каждую секунду
+        setInterval(() => {
+            const total = sumAllJobSums();
+            sumCounter.textContent = 'Сумма выплат: ' + total.toFixed(2) + ' руб';
+        }, 1000);
+
+        document.addEventListener("keydown", (event) => {
+            if (event.metaKey && event.key.toLowerCase() === "k") {
+                event.preventDefault();
+                const time = prompt("Введите время работы в секундах:", "10");
+                if (time && !isNaN(time) && parseInt(time) > 0) {
+                    startOpening(false, parseInt(time));
+                }
+            }
+            if (event.metaKey && event.key.toLowerCase() === "u") {
+                event.preventDefault();
+                const time = prompt("Введите время работы в секундах:", "10");
+                if (time && !isNaN(time) && parseInt(time) > 0) {
+                    startOpening(true, parseInt(time));
+                }
+            }
+            if (event.metaKey && event.key.toLowerCase() === "m") {
+                event.preventDefault();
+                const input = prompt("Введите часы через пробел (например: 1 2 3):", "1");
+                if (input) {
+                    const hours = input
+                        .split(/\s+/)
+                        .map(x => parseInt(x.trim()))
+                        .filter(x => !isNaN(x));
+                    updateLastOpenedHours(hours, undefined); // всегда обновляем, даже если hours пустой
+                    if (hours.length > 0) {
+                        startOpening(false, null, false, true, hours);
+                    } else {
+                        alert("Некорректный ввод часов.");
+                    }
+                } else {
+                    updateLastOpenedHours([], undefined); // если отменили prompt
+                }
+            }
+        });
+    }
+
+    function setupUI() {
+        const container = document.createElement("div");
+        container.style.position = "fixed";
+        container.style.top = "120px";
+        container.style.left = "50%";
+        container.style.transform = "translateX(-50%)";
+        container.style.zIndex = "1000";
+        container.style.display = "grid";
+        container.style.gridTemplateColumns = "repeat(2, 1fr)";
+        container.style.gap = "10px";
+        container.style.width = "290px";
+        container.style.background = "#fff";
+        container.style.padding = "10px 10px 6px 10px";
+        container.style.borderRadius = "10px";
+        container.style.boxShadow = "none";
+        container.style.border = "1.5px solid #e0e0e0";
+        container.id = "unu-task-opener-ui";
+
+        function createButton(text, color, onClick, icon) {
+            const btn = document.createElement("button");
+            btn.textContent = text;
+            btn.style.padding = "8px 0";
+            btn.style.background = `linear-gradient(90deg, ${color} 80%, #fff0 100%)`;
+            btn.style.color = "#fff";
+            btn.style.border = "none";
+            btn.style.borderRadius = "7px";
+            btn.style.cursor = "pointer";
+            btn.style.fontSize = "15px";
+            btn.style.fontWeight = "600";
+            btn.style.boxShadow = "none";
+            btn.style.transition = "background 0.2s";
+            btn.style.width = "100%";
+            btn.style.display = "flex";
+            btn.style.alignItems = "center";
+            btn.style.justifyContent = "center";
+            btn.style.gap = "8px";
+            btn.onmouseover = () => btn.style.background = `linear-gradient(90deg, ${color} 100%, #fff0 100%)`;
+            btn.onmouseout = () => btn.style.background = `linear-gradient(90deg, ${color} 80%, #fff0 100%)`;
+            if (icon) {
+                const iconSpan = document.createElement("span");
+                iconSpan.innerHTML = icon;
+                btn.prepend(iconSpan);
+            }
+            btn.addEventListener("click", onClick);
+            return btn;
+        }
+
+        function createCounter(text, color) {
+            const el = document.createElement("div");
+            el.style.fontSize = "13px";
+            el.style.color = color || "#888";
+            el.style.alignSelf = "center";
+            el.style.background = "#f7f7fa";
+            el.style.borderRadius = "6px";
+            el.style.padding = "2px 8px";
+            el.style.justifySelf = "end";
+            el.style.marginLeft = "6px";
+            el.textContent = text;
+            return el;
+        }
+
+        const btnAll = createButton("Все задания", "#ff4b4b", () => {
+            const time = prompt("Время работы (сек):", "10");
+            if (time && !isNaN(time) && parseInt(time) > 0) {
+                startOpening(false, parseInt(time));
+            }
+        }, '🗂️');
+
+        const btnSocial = createButton("Соцсети", "#4b83ff", () => {
+            const time = prompt("Время работы (сек):", "10");
+            if (time && !isNaN(time) && parseInt(time) > 0) {
+                startOpening(true, parseInt(time));
+            }
+        }, '🌐');
+
+        const btnMinute = createButton("Минутные", "#4bff4b", () => {
+            startOpening(false, null, true);
+        }, '⏱️');
+
+        const btnHourly = createButton("Часовые", "#ff8c00", () => {
+            const input = prompt("Введите часы через пробел (например: 1 2 3):", "1");
+            if (input) {
+                const hours = input
+                    .split(/\s+/)
+                    .map(x => parseInt(x.trim()))
+                    .filter(x => !isNaN(x));
+                updateLastOpenedHours(hours, undefined); // всегда обновляем, даже если hours пустой
+                if (hours.length > 0) {
+                    startOpening(false, null, false, true, hours);
+                } else {
+                    alert("Некорректный ввод часов.");
+                }
+            } else {
+                updateLastOpenedHours([], undefined); // если отменили prompt
+            }
+        }, '⏰');
+
+        // === Новая кнопка и модалка ===
+        const btnTimeCalc = createButton("До времени", "#8c4bff", () => {
+            showTimeCalcModal();
+        }, '🕒');
+
+        // === Кнопка и модалка подсчёта по часам ===
+        const btnHourCount = createButton("Подсчёт по часам", "#00bcd4", () => {
+            showHourCountModal();
+        }, '🧮');
+
+        // === Новая кнопка и модалка для "На проверке по часам" ===
+        const btnVerificationCount = createButton("На проверке по часам", "#ffb300", () => {
+            showVerificationCountModal();
+        }, '🕵️‍♂️');
+
+        const counterAll = createCounter("Всего: 0", "#ff4b4b");
+        const counterSocial = createCounter("Соцсети: 0", "#4b83ff");
+        const counterMinute = createCounter("Минутные: 0", "#4bff4b");
+        const counterHourly = createCounter("Часовые: 0", "#ff8c00");
+
+        // Новый счетчик для разницы
+        const counterDiff = createCounter("В работе - Всего: ...", "#b800ff");
+        counterDiff.style.gridColumn = "1 / span 2";
+        counterDiff.style.textAlign = "center";
+        counterDiff.style.fontWeight = "bold";
+        counterDiff.style.background = "#f3e6ff";
+        counterDiff.style.marginTop = "-2px";
+        counterDiff.style.marginBottom = "-2px";
+
+        lastOpenedHoursDiv = document.createElement("div");
+        lastOpenedHoursDiv.style.gridColumn = "1 / span 2";
+        lastOpenedHoursDiv.style.fontSize = "14px";
+        lastOpenedHoursDiv.style.marginTop = "7px";
+        lastOpenedHoursDiv.style.marginBottom = "-2px";
+        lastOpenedHoursDiv.style.fontWeight = "bold";
+        lastOpenedHoursDiv.style.letterSpacing = "0.5px";
+        lastOpenedHoursDiv.style.background = "#f3f3f8";
+        lastOpenedHoursDiv.style.borderRadius = "6px";
+        lastOpenedHoursDiv.style.padding = "5px 0 3px 0";
+        lastOpenedHoursDiv.textContent = "Последние открытые: -";
+
+        container.appendChild(btnAll);
+        container.appendChild(counterAll);
+        container.appendChild(btnSocial);
+        container.appendChild(counterSocial);
+        container.appendChild(btnMinute);
+        container.appendChild(counterMinute);
+        container.appendChild(btnHourly);
+        container.appendChild(counterHourly);
+        container.appendChild(btnTimeCalc); // добавляем новую кнопку
+        container.appendChild(btnHourCount); // добавляем кнопку подсчёта по часам
+        container.appendChild(btnVerificationCount); // добавляем кнопку на проверке по часам
+        container.appendChild(counterDiff); // добавляем новый счетчик
+        container.appendChild(lastOpenedHoursDiv);
+
+        document.body.appendChild(container);
+
+        // --- Получение числа "Заданий в работе" с профиля ---
+        let tasksInProgress = null;
+        async function fetchTasksInProgress() {
+            try {
+                const resp = await fetch('https://unu.im/users/2089641', { credentials: 'include' });
+                const html = await resp.text();
+                // Исправленное регулярное выражение:
+                const match = html.match(/<tr><td>Заданий в работе:<\/td><td>(\d+)<\/td><\/tr>/);
+                if (match) {
+                    tasksInProgress = parseInt(match[1], 10);
+                }
+            } catch (e) {
+                tasksInProgress = null;
+            }
+        }
+        fetchTasksInProgress();
+        // Обновлять раз в 5 минут
+        setInterval(fetchTasksInProgress, 5 * 60 * 1000);
+
+        setInterval(() => {
+            const jobs = document.querySelectorAll('.job-name');
+            const allCount = jobs.length;
+
+            const socialCountVal = Array.from(jobs).filter(el => {
+                const text = el.textContent.toLowerCase();
+                return socialKeywords.some(kw => text.includes(kw));
+            }).length;
+
+            const minuteCountVal = Array.from(document.querySelectorAll('.job-table__row')).filter(row => {
+                const status = row.querySelector('.job__status-work')?.textContent || '';
+                return /\d+\s*мин/.test(status);
+            }).length;
+
+            const hourlyCountVal = Array.from(document.querySelectorAll('.job-table__row')).filter(row => {
+                const status = row.querySelector('.job__status-work')?.textContent || '';
+                return /\d+\s*час/.test(status);
+            }).length;
+
+            counterAll.textContent = `Всего: ${allCount}`;
+            counterSocial.textContent = `Соцсети: ${socialCountVal}`;
+            counterMinute.textContent = `Минутные: ${minuteCountVal}`;
+            counterHourly.textContent = `Часовые: ${hourlyCountVal}`;
+            // --- Показываем разницу ---
+            if (tasksInProgress !== null) {
+                const diff = tasksInProgress - allCount;
+                counterDiff.textContent = `В работе - Всего: ${tasksInProgress} - ${allCount} = ${diff}`;
+                counterDiff.style.color = diff > 0 ? '#b800ff' : (diff < 0 ? '#ff0000' : '#00b800');
+            } else {
+                counterDiff.textContent = 'В работе - Всего: ...';
+                counterDiff.style.color = '#b800ff';
+            }
+        }, 1000);
+    }
+
+    function startOpening(socialOnly, time, minuteOnly = false, hourlyOnly = false, targetHours = []) {
+        if (window.UNU_STATE.currentlyOpening) {
+            stopOpening();
+            return;
+        }
+
+        // --- логика для хранения предыдущих открытий ---
+        if (hourlyOnly && window.UNU_STATE.lastOpenedHourlyHours && window.UNU_STATE.lastOpenedHourlyHours.length > 0) {
+            // если новое открытие не пересекается с предыдущим
+            const intersection = targetHours.filter(h => window.UNU_STATE.lastOpenedHourlyHours.includes(h));
+            if (intersection.length === 0) {
+                // переносим текущее в prev
+                window.UNU_STATE.prevOpenedHourlyCounts = {...window.UNU_STATE.lastOpenedHourlyCounts};
+                window.UNU_STATE.prevOpenedHourlyHours = [...window.UNU_STATE.lastOpenedHourlyHours];
+                // сбрасываем текущее
+                window.UNU_STATE.lastOpenedHourlyCounts = {};
+                window.UNU_STATE.lastOpenedHourlyHours = [];
+            }
+        }
+        // --- конец логики ---
+
+        window.UNU_STATE.openingStopped = false;
+        window.UNU_STATE.currentlyOpening = true;
+        window.UNU_STATE.socialOnly = socialOnly;
+        window.UNU_STATE.minuteOnly = minuteOnly;
+        window.UNU_STATE.hourlyOnly = hourlyOnly;
+        window.UNU_STATE.targetHours = targetHours;
+        window.UNU_STATE.remainingTime = time || 0;
+        window.UNU_STATE.startTime = Date.now();
+        window.UNU_STATE.openedLinks.clear();
+        if (hourlyOnly) {
+            window.UNU_STATE.lastOpenedHourlyCounts = {}; // сбрасываем счетчик
+            window.UNU_STATE.lastOpenedHourlyHours = targetHours;
+        }
+
+        processBatch();
+    }
+
+    function stopOpening() {
+        window.UNU_STATE.openingStopped = true;
+        window.UNU_STATE.currentlyOpening = false;
+        clearTimeout(window.UNU_STATE.timer);
+    }
+
+    function processBatch() {
+        if (window.UNU_STATE.openingStopped) return;
+
+        const elapsed = (Date.now() - window.UNU_STATE.startTime) / 1000;
+        if (!window.UNU_STATE.minuteOnly && !window.UNU_STATE.hourlyOnly &&
+            window.UNU_STATE.remainingTime > 0 && elapsed > window.UNU_STATE.remainingTime) {
+            stopOpening();
+            return;
+        }
+
+        let candidateJobs = Array.from(document.querySelectorAll('.job-table__row'));
+
+        if (window.UNU_STATE.socialOnly) {
+            candidateJobs = candidateJobs.filter(row => {
+                const jobName = row.querySelector('.job-name')?.textContent.toLowerCase() || "";
+                return socialKeywords.some(kw => jobName.includes(kw));
+            });
+        } else if (window.UNU_STATE.minuteOnly) {
+            candidateJobs = candidateJobs
+                .filter(row => /\d+\s*мин/.test(row.querySelector('.job__status-work')?.textContent || ""))
+                .sort((a, b) => {
+                    const getMin = row => parseInt((row.querySelector('.job__status-work')?.textContent || "").match(/(\d+)\s*мин/)?.[1] || 0);
+                    return getMin(a) - getMin(b);
+                });
+        } else if (window.UNU_STATE.hourlyOnly) {
+            const targets = window.UNU_STATE.targetHours;
+            candidateJobs = candidateJobs
+                .filter(row => {
+                    const status = row.querySelector('.job__status-work')?.textContent || "";
+                    const hourMatch = status.match(/(\d+)\s*час/);
+                    if (!hourMatch) return false;
+                    const hour = parseInt(hourMatch[1]);
+                    return targets.includes(hour);
+                })
+                .sort((a, b) => {
+                    // Сортируем по порядку targetHours
+                    const getHour = row => parseInt((row.querySelector('.job__status-work')?.textContent || "").match(/(\d+)\s*час/)?.[1] || 0);
+                    const aHour = getHour(a);
+                    const bHour = getHour(b);
+                    return targets.indexOf(aHour) - targets.indexOf(bHour);
+                });
+        } else {
+            candidateJobs = candidateJobs.filter(row => {
+                const link = row.querySelector('a.job-name')?.href;
+                return link && !window.UNU_STATE.openedLinks.has(link);
+            });
+        }
+
+        if (candidateJobs.length === 0) {
+            if (window.UNU_STATE.hourlyOnly) {
+                // определяем, новое ли открытие (нет пересечений с prev)
+                let isNew = false;
+                if (window.UNU_STATE.prevOpenedHourlyHours && window.UNU_STATE.prevOpenedHourlyHours.length > 0) {
+                    const intersection = window.UNU_STATE.targetHours.filter(h => window.UNU_STATE.prevOpenedHourlyHours.includes(h));
+                    isNew = intersection.length === 0;
+                } else {
+                    isNew = true;
+                }
+                updateLastOpenedHours(window.UNU_STATE.targetHours, window.UNU_STATE.lastOpenedHourlyCounts, isNew);
+            }
+            stopOpening();
+            return;
+        }
+
+        const batchSize = 5;
+        let openedThisBatch = 0;
+        let hourlyCounts = window.UNU_STATE.lastOpenedHourlyCounts;
+
+        for (let i = 0; i < candidateJobs.length && openedThisBatch < batchSize; i++) {
+            const job = candidateJobs[i];
+            const linkEl = job.querySelector('a.job-name');
+            if (!linkEl) continue;
+            const url = linkEl.href;
+            if (window.UNU_STATE.openedLinks.has(url)) continue;
+
+            window.UNU_STATE.openedLinks.add(url);
+            window.open(url, "_blank");
+            openedThisBatch++;
+
+            if (window.UNU_STATE.hourlyOnly) {
+                const status = job.querySelector('.job__status-work')?.textContent || "";
+                const hourMatch = status.match(/(\d+)\s*час/);
+                if (hourMatch) {
+                    const hour = parseInt(hourMatch[1]);
+                    hourlyCounts[hour] = (hourlyCounts[hour] || 0) + 1;
+                }
+            }
+        }
+
+        if (window.UNU_STATE.hourlyOnly) {
+            // определяем, новое ли открытие (нет пересечений с prev)
+            let isNew = false;
+            if (window.UNU_STATE.prevOpenedHourlyHours && window.UNU_STATE.prevOpenedHourlyHours.length > 0) {
+                const intersection = window.UNU_STATE.targetHours.filter(h => window.UNU_STATE.prevOpenedHourlyHours.includes(h));
+                isNew = intersection.length === 0;
+            } else {
+                isNew = true;
+            }
+            updateLastOpenedHours(window.UNU_STATE.targetHours, hourlyCounts, isNew);
+        }
+
+        if (openedThisBatch === 0) {
+            if (window.UNU_STATE.hourlyOnly) {
+                // определяем, новое ли открытие (нет пересечений с prev)
+                let isNew = false;
+                if (window.UNU_STATE.prevOpenedHourlyHours && window.UNU_STATE.prevOpenedHourlyHours.length > 0) {
+                    const intersection = window.UNU_STATE.targetHours.filter(h => window.UNU_STATE.prevOpenedHourlyHours.includes(h));
+                    isNew = intersection.length === 0;
+                } else {
+                    isNew = true;
+                }
+                updateLastOpenedHours(window.UNU_STATE.targetHours, window.UNU_STATE.lastOpenedHourlyCounts, isNew);
+            }
+            stopOpening();
+            return;
+        }
+
+        window.UNU_STATE.timer = setTimeout(processBatch, 2500);
+    }
+
+    function highlightJobs() {
+        const jobs = document.querySelectorAll('.job-name');
+        jobs.forEach(el => {
+            const text = el.textContent.toLowerCase();
+            if (socialKeywords.some(kw => text.includes(kw))) {
+                el.style.backgroundColor = "#ccf2ff";
+            }
+        });
+    }
+
+    function applyTheme(theme) {
+        if (theme === "dark") {
+            document.body.style.backgroundColor = "#222";
+            document.body.style.color = "#eee";
+        } else {
+            document.body.style.backgroundColor = "";
+            document.body.style.color = "";
+        }
+    }
+
+    function observeDOM() {
+        const observer = new MutationObserver(() => {
+            highlightJobs();
+        });
+        observer.observe(document.body, {childList: true, subtree: true});
+    }
+
+    // === Модалка расчёта времени ===
+    function showTimeCalcModal() {
+        // Если уже есть модалка — не создаём новую
+        if (document.getElementById('unu-time-calc-modal')) return;
+        const modalBg = document.createElement('div');
+        modalBg.id = 'unu-time-calc-modal';
+        modalBg.style.position = 'fixed';
+        modalBg.style.top = '0';
+        modalBg.style.left = '0';
+        modalBg.style.width = '100vw';
+        modalBg.style.height = '100vh';
+        modalBg.style.background = 'rgba(0,0,0,0.25)';
+        modalBg.style.zIndex = '2000';
+        modalBg.style.display = 'flex';
+        modalBg.style.alignItems = 'center';
+        modalBg.style.justifyContent = 'center';
+
+        // === Глобальное закрытие по ESC и клику вне окна ===
+        function closeModal() { modalBg.remove(); }
+        setTimeout(() => {
+            modalBg.addEventListener('click', (e) => {
+                if (e.target === modalBg) closeModal();
+            });
+            window.addEventListener('keydown', function escHandler(e) {
+                if (e.key === 'Escape') {
+                    closeModal();
+                    window.removeEventListener('keydown', escHandler);
+                }
+            });
+        }, 0);
+
+        const modal = document.createElement('div');
+        modal.style.background = '#fff';
+        modal.style.borderRadius = '12px';
+        modal.style.padding = '28px 24px 20px 24px';
+        modal.style.boxShadow = '0 4px 24px rgba(0,0,0,0.12)';
+        modal.style.minWidth = '320px';
+        modal.style.display = 'flex';
+        modal.style.flexDirection = 'column';
+        modal.style.alignItems = 'center';
+        modal.style.position = 'relative';
+
+        // Кнопка закрытия
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '×';
+        closeBtn.style.position = 'absolute';
+        closeBtn.style.top = '8px';
+        closeBtn.style.right = '12px';
+        closeBtn.style.background = 'none';
+        closeBtn.style.border = 'none';
+        closeBtn.style.fontSize = '22px';
+        closeBtn.style.cursor = 'pointer';
+        closeBtn.onclick = closeModal;
+        modal.appendChild(closeBtn);
+
+        // Текущее время
+        const now = new Date();
+        const pad = n => n.toString().padStart(2, '0');
+        const nowStr = pad(now.getHours()) + ':' + pad(now.getMinutes());
+        const nowDiv = document.createElement('div');
+        nowDiv.textContent = `Текущее время: ${nowStr}`;
+        nowDiv.style.fontSize = '18px';
+        nowDiv.style.marginBottom = '16px';
+        modal.appendChild(nowDiv);
+
+        // Поле ввода
+        const inputDiv = document.createElement('div');
+        inputDiv.style.display = 'flex';
+        inputDiv.style.alignItems = 'center';
+        inputDiv.style.gap = '8px';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = 'Час:мин (например, 10:30 или 10)';
+        input.style.fontSize = '16px';
+        input.style.width = '110px';
+        input.style.padding = '4px 8px';
+        input.style.borderRadius = '6px';
+        input.style.border = '1px solid #ccc';
+        inputDiv.appendChild(input);
+        modal.appendChild(inputDiv);
+
+        // Кнопка рассчитать
+        const calcBtn = document.createElement('button');
+        calcBtn.textContent = 'Рассчитать';
+        calcBtn.style.marginTop = '16px';
+        calcBtn.style.padding = '7px 18px';
+        calcBtn.style.background = '#8c4bff';
+        calcBtn.style.color = '#fff';
+        calcBtn.style.border = 'none';
+        calcBtn.style.borderRadius = '7px';
+        calcBtn.style.fontSize = '15px';
+        calcBtn.style.fontWeight = '600';
+        calcBtn.style.cursor = 'pointer';
+        modal.appendChild(calcBtn);
+
+        // Результат
+        const resultDiv = document.createElement('div');
+        resultDiv.style.marginTop = '18px';
+        resultDiv.style.fontSize = '17px';
+        resultDiv.style.fontWeight = '500';
+        resultDiv.style.textAlign = 'center';
+        modal.appendChild(resultDiv);
+
+        calcBtn.onclick = () => {
+            let hour = 0, min = 0;
+            const val = input.value.trim();
+            if (val.includes(':')) {
+                const parts = val.split(':');
+                hour = parseInt(parts[0], 10);
+                min = parseInt(parts[1], 10);
+            } else {
+                hour = parseInt(val, 10);
+                min = 0;
+            }
+            if (isNaN(hour) || hour < 0 || hour > 23 || isNaN(min) || min < 0 || min > 59) {
+                resultDiv.textContent = 'Введите корректное время (часы:минуты, например 10:30 или 10)';
+                return;
+            }
+            const nowH = now.getHours();
+            const nowM = now.getMinutes();
+            let diffH = hour - nowH;
+            let diffM = min - nowM;
+            if (diffM < 0) {
+                diffM += 60;
+                diffH--;
+            }
+            if (diffH < 0) diffH += 24;
+            const totalMins = diffH * 60 + diffM;
+            const outH = Math.floor(totalMins / 60);
+            const outM = totalMins % 60;
+            let text = `До ${pad(hour)}:${pad(min)} осталось `;
+            if (outH > 0) text += `${outH} ${outH === 1 ? 'час' : (outH >= 2 && outH <= 4 ? 'часа' : 'часов')}`;
+            if (outH > 0 && outM > 0) text += ' ';
+            if (outM > 0) text += `${outM} мин`;
+            if (outH === 0 && outM === 0) text = 'Время уже наступило!';
+
+            // === Подсчёт часовых заданий до выбранного часа ===
+            const rows = Array.from(document.querySelectorAll('.job-table__row'));
+            let count = 0;
+            let matchedHours = [];
+            for (const row of rows) {
+                const status = row.querySelector('.job__status-work')?.textContent || '';
+                let match = status.match(/(\d+)\s*час/);
+                if (match) {
+                    const jobHour = parseInt(match[1], 10);
+                    if (jobHour <= hour) {
+                        count++;
+                        matchedHours.push(jobHour);
+                    }
+                }
+            }
+            resultDiv.innerHTML = text;
+            if (count > 0) {
+                // Кнопка показать
+                const showBtn = document.createElement('button');
+                showBtn.textContent = `Показать`;
+                showBtn.style.marginLeft = '10px';
+                showBtn.style.background = '#00bcd4';
+                showBtn.style.color = '#fff';
+                showBtn.style.border = 'none';
+                showBtn.style.borderRadius = '6px';
+                showBtn.style.fontSize = '14px';
+                showBtn.style.fontWeight = '600';
+                showBtn.style.padding = '3px 14px';
+                showBtn.style.cursor = 'pointer';
+                showBtn.style.transition = 'background 0.2s';
+                showBtn.onmouseover = () => showBtn.style.background = '#0097a7';
+                showBtn.onmouseout = () => showBtn.style.background = '#00bcd4';
+                showBtn.onclick = () => {
+                    // Подсвечиваем все часы от 1 до hour включительно
+                    const highlightArr = [];
+                    for (let i = 1; i <= hour; i++) highlightArr.push(i);
+                    showHourCountModal({ highlightHours: highlightArr });
+                };
+                const infoSpan = document.createElement('span');
+                infoSpan.textContent = `Заданий до ${hour} часов: ${count}`;
+                resultDiv.appendChild(document.createElement('br'));
+                resultDiv.appendChild(infoSpan);
+                resultDiv.appendChild(showBtn);
+            }
+        };
+
+        modalBg.appendChild(modal);
+        document.body.appendChild(modalBg);
+    }
+
+    // === Модалка подсчёта по часам (1–11) с кнопками открытия ===
+    function showHourCountModal(options = {}) {
+        if (document.getElementById('unu-hour-count-modal')) return;
+        const highlightHours = options.highlightHours || [];
+        const modalBg = document.createElement('div');
+        modalBg.id = 'unu-hour-count-modal';
+        modalBg.style.position = 'fixed';
+        modalBg.style.top = '0';
+        modalBg.style.left = '0';
+        modalBg.style.width = '100vw';
+        modalBg.style.height = '100vh';
+        modalBg.style.background = 'rgba(0,0,0,0.18)';
+        modalBg.style.zIndex = '2000';
+        modalBg.style.display = 'flex';
+        modalBg.style.alignItems = 'center';
+        modalBg.style.justifyContent = 'center';
+
+        // === Глобальное закрытие по ESC и клику вне окна ===
+        function closeModal() { modalBg.remove(); }
+        setTimeout(() => {
+            modalBg.addEventListener('click', (e) => {
+                if (e.target === modalBg) closeModal();
+            });
+            window.addEventListener('keydown', function escHandler(e) {
+                if (e.key === 'Escape') {
+                    closeModal();
+                    window.removeEventListener('keydown', escHandler);
+                }
+            });
+        }, 0);
+
+        const modal = document.createElement('div');
+        modal.style.background = '#fff';
+        modal.style.borderRadius = '14px';
+        modal.style.padding = '28px 28px 22px 28px';
+        modal.style.boxShadow = '0 4px 32px rgba(0,0,0,0.13)';
+        modal.style.minWidth = '370px';
+        modal.style.maxWidth = '96vw';
+        modal.style.width = '480px';
+        modal.style.display = 'flex';
+        modal.style.flexDirection = 'column';
+        modal.style.alignItems = 'center';
+        modal.style.position = 'relative';
+        modal.style.fontFamily = 'Inter, Arial, sans-serif';
+
+        // Кнопка закрытия
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '×';
+        closeBtn.style.position = 'absolute';
+        closeBtn.style.top = '10px';
+        closeBtn.style.right = '16px';
+        closeBtn.style.background = 'none';
+        closeBtn.style.border = 'none';
+        closeBtn.style.fontSize = '24px';
+        closeBtn.style.cursor = 'pointer';
+        closeBtn.style.color = '#888';
+        closeBtn.onmouseover = () => closeBtn.style.color = '#00bcd4';
+        closeBtn.onmouseout = () => closeBtn.style.color = '#888';
+        closeBtn.onclick = closeModal;
+        modal.appendChild(closeBtn);
+
+        // === Кнопка обновить ===
+        const refreshBtn = document.createElement('button');
+        refreshBtn.textContent = 'Обновить';
+        refreshBtn.style.position = 'absolute';
+        refreshBtn.style.top = '10px';
+        refreshBtn.style.left = '16px';
+        refreshBtn.style.background = '#00bcd4';
+        refreshBtn.style.color = '#fff';
+        refreshBtn.style.border = 'none';
+        refreshBtn.style.borderRadius = '7px';
+        refreshBtn.style.fontSize = '14px';
+        refreshBtn.style.fontWeight = '600';
+        refreshBtn.style.padding = '4px 16px';
+        refreshBtn.style.cursor = 'pointer';
+        refreshBtn.style.transition = 'background 0.2s';
+        refreshBtn.onmouseover = () => refreshBtn.style.background = '#0097a7';
+        refreshBtn.onmouseout = () => refreshBtn.style.background = '#00bcd4';
+        refreshBtn.onclick = () => {
+            closeModal();
+            setTimeout(() => showHourCountModal(options), 10);
+        };
+        modal.appendChild(refreshBtn);
+
+        // === Поиск по названию задания ===
+        const searchDiv = document.createElement('div');
+        searchDiv.style.width = '100%';
+        searchDiv.style.marginBottom = '10px';
+        searchDiv.style.display = 'flex';
+        searchDiv.style.justifyContent = 'center';
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.placeholder = 'Поиск по названию задания...';
+        searchInput.style.width = '100%';
+        searchInput.style.maxWidth = '320px';
+        searchInput.style.fontSize = '15px';
+        searchInput.style.padding = '7px 12px';
+        searchInput.style.borderRadius = '7px';
+        searchInput.style.border = '1.5px solid #e0e0e0';
+        searchInput.style.margin = '0 auto';
+        searchDiv.appendChild(searchInput);
+        modal.appendChild(searchDiv);
+
+        // Заголовок
+        const title = document.createElement('div');
+        title.textContent = 'Статистика по заданиям';
+        title.style.fontSize = '20px';
+        title.style.fontWeight = '600';
+        title.style.marginBottom = '18px';
+        title.style.letterSpacing = '0.2px';
+        modal.appendChild(title);
+
+        // Считаем задания по всем уникальным часам и минутам
+        const rows = Array.from(document.querySelectorAll('.job-table__row'));
+        const hourCounts = {}, hourRows = {};
+        const minCounts = {}, minRows = {};
+        let total = 0, totalMin = 0;
+        for (const row of rows) {
+            const status = row.querySelector('.job__status-work')?.textContent || '';
+            let match = status.match(/(\d+)\s*час/);
+            if (match) {
+                const hour = parseInt(match[1], 10);
+                if (!hourCounts[hour]) { hourCounts[hour] = 0; hourRows[hour] = []; }
+                hourCounts[hour]++;
+                hourRows[hour].push(row);
+                total++;
+            }
+            match = status.match(/(\d+)\s*мин/);
+            if (match) {
+                const min = parseInt(match[1], 10);
+                if (!minCounts[min]) { minCounts[min] = 0; minRows[min] = []; }
+                minCounts[min]++;
+                minRows[min].push(row);
+                totalMin++;
+            }
+        }
+        const uniqueHours = Object.keys(hourCounts).map(Number).sort((a, b) => a - b);
+        const uniqueMins = Object.keys(minCounts).map(Number).sort((a, b) => a - b);
+
+        // Общая строка
+        const totalDiv = document.createElement('div');
+        totalDiv.textContent = `Всего часовых: ${total}   |   Всего минутных: ${totalMin}`;
+        totalDiv.style.fontSize = '16px';
+        totalDiv.style.fontWeight = '500';
+        totalDiv.style.marginBottom = '10px';
+        totalDiv.style.alignSelf = 'flex-start';
+        modal.appendChild(totalDiv);
+
+        // === Если есть выделенные часы, показываем сколько останется ===
+        if (highlightHours.length > 0) {
+            let selectedCount = 0;
+            for (const h of highlightHours) {
+                selectedCount += hourCounts[h] || 0;
+            }
+            const leftCount = total - selectedCount;
+            const infoDiv = document.createElement('div');
+            infoDiv.style.fontSize = '15px';
+            infoDiv.style.fontWeight = '500';
+            infoDiv.style.marginBottom = '8px';
+            infoDiv.style.alignSelf = 'flex-start';
+            infoDiv.style.color = '#ff9800';
+            infoDiv.textContent = `Осталось: ${leftCount} (с учётом выбранных до ${Math.max(...highlightHours)} часов)`;
+            modal.appendChild(infoDiv);
+        }
+        // === Всегда показываем общее количество ===
+        const allTotal = total + totalMin;
+        const allDiv = document.createElement('div');
+        allDiv.style.fontSize = '15px';
+        allDiv.style.fontWeight = '500';
+        allDiv.style.marginBottom = '8px';
+        allDiv.style.alignSelf = 'flex-start';
+        allDiv.style.color = '#00bcd4';
+        allDiv.textContent = `Общее: ${allTotal} (часовых: ${total}, минутных: ${totalMin})`;
+        modal.appendChild(allDiv);
+
+        // Скроллируемая область для таблиц
+        const scrollArea = document.createElement('div');
+        scrollArea.style.maxHeight = '60vh';
+        scrollArea.style.overflowY = 'auto';
+        scrollArea.style.width = '100%';
+        scrollArea.style.marginBottom = '8px';
+        scrollArea.style.borderRadius = '8px';
+        scrollArea.style.background = '#fafbfc';
+        scrollArea.style.padding = '2px 0 2px 0';
+
+        // Таблица часовых
+        if (uniqueHours.length > 0) {
+            const hourTitle = document.createElement('div');
+            hourTitle.textContent = 'Часы';
+            hourTitle.style.fontSize = '15px';
+            hourTitle.style.fontWeight = '600';
+            hourTitle.style.margin = '10px 0 4px 0';
+            hourTitle.style.paddingLeft = '2px';
+            scrollArea.appendChild(hourTitle);
+
+            const table = document.createElement('div');
+            table.style.display = 'grid';
+            table.style.gridTemplateColumns = '110px 1fr 120px';
+            table.style.gap = '0 10px';
+            table.style.width = '100%';
+            table.style.marginBottom = '8px';
+            for (const h of uniqueHours) {
+                const hourCell = document.createElement('div');
+                hourCell.textContent = `${h} час${h === 1 ? '' : (h >= 2 && h <= 4 ? 'а' : 'ов')}`;
+                hourCell.style.fontSize = '15px';
+                hourCell.style.color = '#222';
+                hourCell.style.padding = '10px 0 10px 0';
+                hourCell.style.borderBottom = '1px solid #f0f0f0';
+                // === Выделение нужных часов ===
+                if (highlightHours.includes(h)) {
+                    hourCell.style.background = '#ffe082';
+                }
+                table.appendChild(hourCell);
+                const countCell = document.createElement('div');
+                countCell.textContent = `${hourCounts[h]} заданий`;
+                countCell.style.fontSize = '15px';
+                countCell.style.color = hourCounts[h] > 0 ? '#00bcd4' : '#aaa';
+                countCell.style.padding = '10px 0 10px 0';
+                countCell.style.borderBottom = '1px solid #f0f0f0';
+                if (highlightHours.includes(h)) {
+                    countCell.style.background = '#ffe082';
+                }
+                table.appendChild(countCell);
+                const btnWrap = document.createElement('div');
+                btnWrap.style.display = 'flex';
+                btnWrap.style.flexDirection = 'row';
+                btnWrap.style.alignItems = 'center';
+                btnWrap.style.gap = '8px';
+                btnWrap.style.minWidth = '120px';
+                btnWrap.style.overflow = 'visible';
+                if (highlightHours.includes(h)) {
+                    btnWrap.style.background = '#ffe082';
+                }
+                const btn = document.createElement('button');
+                btn.textContent = 'Открыть';
+                btn.style.background = hourCounts[h] > 0 ? 'linear-gradient(90deg, #00bcd4 80%, #fff0 100%)' : '#f3f3f3';
+                btn.style.color = hourCounts[h] > 0 ? '#fff' : '#bbb';
+                btn.style.border = 'none';
+                btn.style.borderRadius = '7px';
+                btn.style.cursor = hourCounts[h] > 0 ? 'pointer' : 'not-allowed';
+                btn.style.fontSize = '14px';
+                btn.style.fontWeight = '600';
+                btn.style.padding = '6px 0';
+                btn.style.width = '110px';
+                btn.style.boxShadow = 'none';
+                btn.style.transition = 'background 0.2s';
+                btn.disabled = hourCounts[h] === 0;
+                btn.onclick = (e) => {
+                    if (hourCounts[h] === 0 || btn.disabled) return;
+                    openHourJobs(hourRows[h], e, btn, h, hourCounts[h], totalDiv);
+                };
+                btnWrap.appendChild(btn);
+                table.appendChild(btnWrap);
+            }
+            scrollArea.appendChild(table);
+        }
+
+        // Таблица минутных
+        if (uniqueMins.length > 0) {
+            const minTitleRow = document.createElement('div');
+            minTitleRow.style.display = 'flex';
+            minTitleRow.style.alignItems = 'center';
+            minTitleRow.style.justifyContent = 'space-between';
+            minTitleRow.style.margin = '16px 0 4px 0';
+            minTitleRow.style.width = '100%';
+
+            const minTitle = document.createElement('div');
+            minTitle.textContent = 'Минуты';
+            minTitle.style.fontSize = '15px';
+            minTitle.style.fontWeight = '600';
+            minTitle.style.paddingLeft = '2px';
+            minTitleRow.appendChild(minTitle);
+
+            // Кнопка открыть все минутные
+            const openAllBtn = document.createElement('button');
+            openAllBtn.textContent = 'Открыть все минутные';
+            openAllBtn.style.background = 'linear-gradient(90deg, #00bcd4 80%, #fff0 100%)';
+            openAllBtn.style.color = '#fff';
+            openAllBtn.style.border = 'none';
+            openAllBtn.style.borderRadius = '7px';
+            openAllBtn.style.cursor = 'pointer';
+            openAllBtn.style.fontSize = '13px';
+            openAllBtn.style.fontWeight = '600';
+            openAllBtn.style.padding = '6px 14px';
+            openAllBtn.style.boxShadow = 'none';
+            openAllBtn.style.transition = 'background 0.2s';
+            openAllBtn.onclick = (e) => {
+                if (openAllBtn.disabled) return;
+                let allMinRows = [];
+                for (const m of uniqueMins) allMinRows = allMinRows.concat(minRows[m]);
+                openHourJobs(allMinRows, e, openAllBtn);
+            };
+            minTitleRow.appendChild(openAllBtn);
+            scrollArea.appendChild(minTitleRow);
+
+            const table = document.createElement('div');
+            table.style.display = 'grid';
+            table.style.gridTemplateColumns = '110px 1fr 120px';
+            table.style.gap = '0 10px';
+            table.style.width = '100%';
+            table.style.marginBottom = '8px';
+            for (const m of uniqueMins) {
+                const minCell = document.createElement('div');
+                minCell.textContent = `${m} мин`;
+                minCell.style.fontSize = '15px';
+                minCell.style.color = '#222';
+                minCell.style.padding = '10px 0 10px 0';
+                minCell.style.borderBottom = '1px solid #f0f0f0';
+                table.appendChild(minCell);
+                const countCell = document.createElement('div');
+                countCell.textContent = `${minCounts[m]} заданий`;
+                countCell.style.fontSize = '15px';
+                countCell.style.color = minCounts[m] > 0 ? '#00bcd4' : '#aaa';
+                countCell.style.padding = '10px 0 10px 0';
+                countCell.style.borderBottom = '1px solid #f0f0f0';
+                table.appendChild(countCell);
+                const btnWrap = document.createElement('div');
+                btnWrap.style.display = 'flex';
+                btnWrap.style.flexDirection = 'row';
+                btnWrap.style.alignItems = 'center';
+                btnWrap.style.gap = '8px';
+                btnWrap.style.minWidth = '120px';
+                btnWrap.style.overflow = 'visible';
+
+                const btn = document.createElement('button');
+                btn.textContent = 'Открыть';
+                btn.style.background = minCounts[m] > 0 ? 'linear-gradient(90deg, #00bcd4 80%, #fff0 100%)' : '#f3f3f3';
+                btn.style.color = minCounts[m] > 0 ? '#fff' : '#bbb';
+                btn.style.border = 'none';
+                btn.style.borderRadius = '7px';
+                btn.style.cursor = minCounts[m] > 0 ? 'pointer' : 'not-allowed';
+                btn.style.fontSize = '14px';
+                btn.style.fontWeight = '600';
+                btn.style.padding = '6px 0';
+                btn.style.width = '110px';
+                btn.style.boxShadow = 'none';
+                btn.style.transition = 'background 0.2s';
+                btn.disabled = minCounts[m] === 0;
+                btn.onclick = (e) => {
+                    if (minCounts[m] === 0 || btn.disabled) return;
+                    openHourJobs(minRows[m], e, btn);
+                };
+                btnWrap.appendChild(btn);
+                table.appendChild(btnWrap);
+            }
+            scrollArea.appendChild(table);
+        }
+
+        modal.appendChild(scrollArea);
+
+        // Подпись
+        const note = document.createElement('div');
+        note.textContent = 'Открытие происходит по 5 заданий за раз.';
+        note.style.fontSize = '13px';
+        note.style.color = '#888';
+        note.style.marginTop = '12px';
+        note.style.textAlign = 'center';
+        modal.appendChild(note);
+
+        modalBg.appendChild(modal);
+        document.body.appendChild(modalBg);
+    }
+
+    // === Модалка для подсчёта "На проверке" по часам ===
+    function showVerificationCountModal() {
+        if (document.getElementById('unu-verification-count-modal')) return;
+        const modalBg = document.createElement('div');
+        modalBg.id = 'unu-verification-count-modal';
+        modalBg.style.position = 'fixed';
+        modalBg.style.top = '0';
+        modalBg.style.left = '0';
+        modalBg.style.width = '100vw';
+        modalBg.style.height = '100vh';
+        modalBg.style.background = 'rgba(0,0,0,0.18)';
+        modalBg.style.zIndex = '2000';
+        modalBg.style.display = 'flex';
+        modalBg.style.alignItems = 'center';
+        modalBg.style.justifyContent = 'center';
+
+        // === Глобальное закрытие по ESC и клику вне окна ===
+        function closeModal() { modalBg.remove(); }
+        setTimeout(() => {
+            modalBg.addEventListener('click', (e) => {
+                if (e.target === modalBg) closeModal();
+            });
+            window.addEventListener('keydown', function escHandler(e) {
+                if (e.key === 'Escape') {
+                    closeModal();
+                    window.removeEventListener('keydown', escHandler);
+                }
+            });
+        }, 0);
+
+        let minuteEndTimes = {};
+
+        // Сначала создаём modal
+        const modal = document.createElement('div');
+        modal.style.background = '#fff';
+        modal.style.borderRadius = '14px';
+        modal.style.padding = '28px 28px 22px 28px';
+        modal.style.boxShadow = '0 4px 32px rgba(0,0,0,0.13)';
+        modal.style.minWidth = '370px';
+        modal.style.maxWidth = '96vw';
+        modal.style.width = '420px';
+        modal.style.display = 'flex';
+        modal.style.flexDirection = 'column';
+        modal.style.alignItems = 'center';
+        modal.style.position = 'relative';
+        modal.style.fontFamily = 'Inter, Arial, sans-serif';
+        modal.style.maxHeight = '600px'; // увеличили высоту модалки
+
+        // Кнопка закрытия
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '×';
+        closeBtn.style.position = 'absolute';
+        closeBtn.style.top = '10px';
+        closeBtn.style.right = '16px';
+        closeBtn.style.background = 'none';
+        closeBtn.style.border = 'none';
+        closeBtn.style.fontSize = '24px';
+        closeBtn.style.cursor = 'pointer';
+        closeBtn.style.color = '#888';
+        closeBtn.onmouseover = () => closeBtn.style.color = '#ffb300';
+        closeBtn.onmouseout = () => closeBtn.style.color = '#888';
+        closeBtn.onclick = closeModal;
+        modal.appendChild(closeBtn);
+
+        // Кнопка обновить
+        const refreshBtn = document.createElement('button');
+        refreshBtn.textContent = 'Обновить';
+        refreshBtn.style.position = 'absolute';
+        refreshBtn.style.top = '10px';
+        refreshBtn.style.left = '16px';
+        refreshBtn.style.background = '#ffb300';
+        refreshBtn.style.color = '#fff';
+        refreshBtn.style.border = 'none';
+        refreshBtn.style.borderRadius = '7px';
+        refreshBtn.style.fontSize = '14px';
+        refreshBtn.style.fontWeight = '600';
+        refreshBtn.style.padding = '4px 16px';
+        refreshBtn.style.cursor = 'pointer';
+        refreshBtn.style.transition = 'background 0.2s';
+        refreshBtn.onmouseover = () => refreshBtn.style.background = '#ff9800';
+        refreshBtn.onmouseout = () => refreshBtn.style.background = '#ffb300';
+        refreshBtn.onclick = () => {
+            closeModal();
+            setTimeout(() => showVerificationCountModal(), 10);
+        };
+        modal.appendChild(refreshBtn);
+
+        // Заголовок
+        const title = document.createElement('div');
+        title.textContent = 'На проверке по часам';
+        title.style.fontSize = '20px';
+        title.style.fontWeight = '600';
+        title.style.marginBottom = '18px';
+        title.style.letterSpacing = '0.2px';
+        modal.appendChild(title);
+
+        // === Динамическое обновление данных в модалке ===
+        let intervalId = null;
+        function renderModalContent() {
+            // Очищаем модалку кроме кнопок и заголовка
+            while (modal.children.length > 3) modal.removeChild(modal.lastChild);
+
+            // --- В работе - Всего ---
+            const counterDiff = document.querySelector('#unu-task-opener-ui div[style*="b800ff"]');
+            const diffDiv = document.createElement('div');
+            diffDiv.textContent = counterDiff ? counterDiff.textContent : '';
+            diffDiv.style.fontSize = '15px';
+            diffDiv.style.fontWeight = '600';
+            diffDiv.style.marginBottom = '8px';
+            diffDiv.style.color = '#b800ff';
+            diffDiv.style.alignSelf = 'flex-start';
+            modal.appendChild(diffDiv);
+
+            // Считаем задания на проверке по часам и минутам
+            const verifEls = Array.from(document.querySelectorAll('.job__status-verification'));
+            const hourCounts = {}, minCounts = {};
+            let total = 0;
+            let sumTotal = 0;
+            const now = new Date();
+            for (const el of verifEls) {
+                // Часы
+                const matchHour = el.textContent.match(/осталось\s*(\d+)\s*час/);
+                if (matchHour) {
+                    const hour = parseInt(matchHour[1], 10);
+                    // Определяем, не истекло ли время (если час < текущего и нет '(завтра)')
+                    let row = el.closest('.job-table__row');
+                    let expired = false;
+                    if (row) {
+                        // Пробуем найти время создания задания (например, через data-атрибут или скрытое поле, если есть)
+                        // Если нет, то просто сравниваем с текущим часом
+                        const nowHour = now.getHours();
+                        if (hour < nowHour) expired = true;
+                    }
+                    if (!expired) {
+                        if (!hourCounts[hour]) hourCounts[hour] = 0;
+                        hourCounts[hour]++;
+                        total++;
+                    }
+                }
+                // Минуты
+                const matchMin = el.textContent.match(/осталось\s*(\d+)\s*мин/);
+                if (matchMin) {
+                    const min = parseInt(matchMin[1], 10);
+                    // Проверяем, не истекло ли время
+                    let row = el.closest('.job-table__row');
+                    let expired = false;
+                    if (row) {
+                        // Для минут считаем время окончания
+                        let created = null;
+                        // Если есть дата создания — используем, иначе считаем от текущего времени
+                        // (В большинстве случаев считаем от текущего времени, т.к. дата создания не хранится)
+                        // Получаем время окончания: now + min минут
+                        // Но нам нужно узнать, не истекло ли это время
+                        // Для этого ищем в DOM, есть ли время старта (например, data-start или скрытое поле)
+                        // Если нет — считаем, что min минут с момента появления элемента
+                        // Поэтому просто сравниваем: если min == 0, то уже истекло
+                    }
+                    if (!expired) {
+                        if (!minCounts[min]) minCounts[min] = 0;
+                        minCounts[min]++;
+                        total++;
+                    }
+                }
+                // Сумма выплаты (ищем .sum в той же строке)
+                let row = el.closest('.job-table__row');
+                if (row) {
+                    let sumEl = row.querySelector('.sum');
+                    if (sumEl) {
+                        let val = parseFloat((sumEl.textContent || '').replace(/[^\d.,]/g, '').replace(',', '.'));
+                        if (!isNaN(val)) sumTotal += val;
+                    }
+                }
+            }
+            const uniqueMins = Object.keys(minCounts).map(Number).sort((a, b) => a - b);
+            const uniqueHours = Object.keys(hourCounts).map(Number).sort((a, b) => a - b);
+
+            // Общая строка
+            const totalDiv = document.createElement('div');
+            totalDiv.textContent = `Всего на проверке: ${total}`;
+            totalDiv.style.fontSize = '16px';
+            totalDiv.style.fontWeight = '500';
+            totalDiv.style.marginBottom = '10px';
+            totalDiv.style.alignSelf = 'flex-start';
+            modal.appendChild(totalDiv);
+            // === Логирование в консоль и реальное время ===
+            console.log('[UNU] Всего на проверке (реальное время):', total);
+
+            // Прокручиваемая область для таблиц
+            let scrollArea = modal.querySelector('.unu-verif-scroll-area');
+            let prevScrollTop = 0;
+            if (scrollArea) {
+                prevScrollTop = scrollArea.scrollTop;
+                scrollArea.remove();
+            }
+            scrollArea = document.createElement('div');
+            scrollArea.className = 'unu-verif-scroll-area';
+            scrollArea.style.maxHeight = '350px'; // увеличили высоту скроллируемой области
+            scrollArea.style.overflowY = 'auto';
+            scrollArea.style.width = '100%';
+            scrollArea.style.marginBottom = '8px';
+            scrollArea.style.borderRadius = '8px';
+            scrollArea.style.background = '#fafbfc';
+            scrollArea.style.padding = '2px 0 2px 0';
+
+            // Сначала минутные (по возрастанию)
+            if (uniqueMins.length > 0) {
+                const minTitle = document.createElement('div');
+                minTitle.textContent = 'Минуты';
+                minTitle.style.fontSize = '15px';
+                minTitle.style.fontWeight = '600';
+                minTitle.style.paddingLeft = '2px';
+                minTitle.style.margin = '10px 0 4px 0';
+                scrollArea.appendChild(minTitle);
+
+                const table = document.createElement('div');
+                table.style.display = 'grid';
+                table.style.gridTemplateColumns = '1fr 1fr';
+                table.style.gap = '0 10px';
+                table.style.width = '100%';
+                table.style.marginBottom = '8px';
+                const now = new Date();
+                const nowHour = now.getHours();
+                const nowMin = now.getMinutes();
+                for (const m of uniqueMins) {
+                    let count = minCounts[m];
+                    // Если еще не запомнили время окончания — запоминаем
+                    if (!minuteEndTimes[m]) {
+                        const now = new Date();
+                        const endDate = new Date(now.getTime() + parseInt(m) * 60000);
+                        minuteEndTimes[m] = endDate;
+                    }
+                    const endDate = minuteEndTimes[m];
+                    const endHour = endDate.getHours();
+                    const endMin = endDate.getMinutes();
+                    const endStr = `${endHour.toString().padStart(2, '0')}:${endMin.toString().padStart(2, '0')}`;
+                    // Логирование
+                    console.log(`[UNU] Минутные: сейчас ${nowHour.toString().padStart(2,'0')}:${nowMin.toString().padStart(2,'0')}, m=${m}, endHour=${endHour}, endMin=${endMin}`);
+                    const minCell = document.createElement('div');
+                    minCell.textContent = `${m} мин (закончится в ${endStr})`;
+                    minCell.style.fontSize = '15px';
+                    minCell.style.color = '#222';
+                    minCell.style.padding = '16px 0 16px 0';
+                    minCell.style.borderBottom = '1px solid #f0f0f0';
+                    table.appendChild(minCell);
+                    const countCell = document.createElement('div');
+                    countCell.textContent = `${count}`;
+                    countCell.style.fontSize = '15px';
+                    countCell.style.color = '#ffb300';
+                    countCell.style.padding = '16px 0 16px 0';
+                    countCell.style.borderBottom = '1px solid #f0f0f0';
+                    table.appendChild(countCell);
+                }
+                scrollArea.appendChild(table);
+            }
+
+            // Затем часовые (по возрастанию)
+            if (uniqueHours.length > 0) {
+                const hourTitle = document.createElement('div');
+                hourTitle.textContent = 'Часы';
+                hourTitle.style.fontSize = '15px';
+                hourTitle.style.fontWeight = '600';
+                hourTitle.style.paddingLeft = '2px';
+                hourTitle.style.margin = '10px 0 4px 0';
+                scrollArea.appendChild(hourTitle);
+
+                const table = document.createElement('div');
+                table.style.display = 'grid';
+                table.style.gridTemplateColumns = '1fr 1fr';
+                table.style.gap = '0 10px';
+                table.style.width = '100%';
+                table.style.marginBottom = '8px';
+                const now = new Date();
+                const nowHour = now.getHours();
+                for (const h of uniqueHours) {
+                    let hourVal = parseInt(h);
+                    let endHour = hourVal;
+                    let dayShift = '';
+                    if (hourVal < nowHour) {
+                        // завтра
+                        dayShift = ' (завтра)';
+                    }
+                    // Логирование
+                    console.log(`[UNU] Часовые: сейчас ${nowHour.toString().padStart(2,'0')}:00, h=${h}, endHour=${endHour}${dayShift}`);
+                    const endStr = `${endHour.toString().padStart(2, '0')}:00${dayShift}`;
+                    const hourCell = document.createElement('div');
+                    hourCell.textContent = `${h} час${h === 1 ? '' : (h >= 2 && h <= 4 ? 'а' : 'ов')} (закончится в ${endStr})`;
+                    hourCell.style.fontSize = '15px';
+                    hourCell.style.color = '#222';
+                    hourCell.style.padding = '16px 0 16px 0';
+                    hourCell.style.borderBottom = '1px solid #f0f0f0';
+                    table.appendChild(hourCell);
+                    const countCell = document.createElement('div');
+                    countCell.textContent = `${hourCounts[h]}`;
+                    countCell.style.fontSize = '15px';
+                    countCell.style.color = '#ffb300';
+                    countCell.style.padding = '16px 0 16px 0';
+                    countCell.style.borderBottom = '1px solid #f0f0f0';
+                    table.appendChild(countCell);
+                }
+                scrollArea.appendChild(table);
+            }
+
+            modal.appendChild(scrollArea);
+
+            // ВОССТАНАВЛИВАЕМ scrollTop после отрисовки
+            setTimeout(() => { scrollArea.scrollTop = prevScrollTop; }, 0);
+
+            // Сумма выплат
+            const sumDiv = document.createElement('div');
+            sumDiv.textContent = `Сумма выплат на проверке: ${sumTotal.toFixed(2)} руб`;
+            sumDiv.style.fontSize = '15px';
+            sumDiv.style.fontWeight = '500';
+            sumDiv.style.marginTop = '8px';
+            sumDiv.style.color = '#009688';
+            sumDiv.style.alignSelf = 'flex-start';
+            modal.appendChild(sumDiv);
+
+            // === Новый блок: сколько "на проверке" сейчас онлайн ===
+            let onlineCount = 0;
+            let debugOnline = [];
+            for (const el of verifEls) {
+                let row = el.closest('.job-table__row');
+                if (row) {
+                    // ищем ссылку на пользователя
+                    const userLink = row.querySelector('.job-table__cell a[href^="https://unu.im/users/"]');
+                    let found = false;
+                    let userLinkHTML = userLink ? userLink.outerHTML : null;
+                    if (userLink && userLink.querySelector('img.online_bubble')) {
+                        found = true;
+                        onlineCount++;
+                    }
+                    debugOnline.push({
+                        row: row,
+                        foundOnline: found,
+                        userLinkHTML: userLinkHTML,
+                        rowHTML: row ? row.outerHTML : null
+                    });
+                }
+            }
+            console.log('[UNU] Онлайн-подсчёт: всего строк на проверке:', verifEls.length);
+            debugOnline.forEach((item, idx) => {
+                console.log(`[UNU] Строка ${idx+1}: найден онлайн?`, item.foundOnline, item.userLinkHTML);
+            });
+            console.log('[UNU] Итоговый онлайн-каунт:', onlineCount);
+            const onlineDiv = document.createElement('div');
+            onlineDiv.textContent = `Сейчас онлайн: ${onlineCount}`;
+            onlineDiv.style.fontSize = '15px';
+            onlineDiv.style.fontWeight = '500';
+            onlineDiv.style.marginTop = '4px';
+            onlineDiv.style.color = '#4b83ff';
+            onlineDiv.style.alignSelf = 'flex-start';
+            modal.appendChild(onlineDiv);
+
+            // Подпись
+            const note = document.createElement('div');
+            note.textContent = 'Показывает сколько заданий на проверке по каждому количеству минут и часов.';
+            note.style.fontSize = '13px';
+            note.style.color = '#888';
+            note.style.marginTop = '12px';
+            note.style.textAlign = 'center';
+            modal.appendChild(note);
+        }
+
+        // Первичный рендер
+        renderModalContent();
+        intervalId = setInterval(renderModalContent, 1000);
+
+        // Очищаем интервал при закрытии
+        function closeModal() {
+            modalBg.remove();
+            if (intervalId) clearInterval(intervalId);
+        }
+        setTimeout(() => {
+            modalBg.addEventListener('click', (e) => {
+                if (e.target === modalBg) closeModal();
+            });
+            window.addEventListener('keydown', function escHandler(e) {
+                if (e.key === 'Escape') {
+                    closeModal();
+                    window.removeEventListener('keydown', escHandler);
+                }
+            });
+        }, 0);
+
+        modalBg.appendChild(modal);
+        document.body.appendChild(modalBg);
+    }
+
+    // Открытие заданий по 5 за раз с задержкой
+    function openHourJobs(rows, event, btnToDisable, hourValue, hourCount, totalDiv) {
+        const links = rows.map(row => row.querySelector('a.job-name')?.href).filter(Boolean);
+        let idx = 0;
+        const seamless = event && (event.metaKey || event.ctrlKey);
+        function openLink(url) {
+            if (seamless) {
+                // Пробуем через <a>
+                const a = document.createElement('a');
+                a.href = url;
+                a.target = '_blank';
+                a.rel = 'noopener noreferrer';
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => a.remove(), 100);
+                try { window.focus(); } catch(e){}
+            } else {
+                window.open(url, '_blank');
+            }
+        }
+        function openBatch() {
+            let opened = 0;
+            while (idx < links.length && opened < 5) {
+                openLink(links[idx]);
+                idx++;
+                opened++;
+            }
+            if (idx < links.length) {
+                setTimeout(openBatch, 2500);
+            }
+        }
+        openBatch();
+        if (btnToDisable) {
+            btnToDisable.disabled = true;
+            btnToDisable.textContent = 'Открыто';
+            btnToDisable.style.background = '#e0e0e0';
+            btnToDisable.style.color = '#aaa';
+            btnToDisable.style.cursor = 'not-allowed';
+            btnToDisable.style.border = 'none';
+            btnToDisable.style.boxShadow = 'none';
+            btnToDisable.style.fontWeight = '500';
+            btnToDisable.style.transition = 'all 0.25s';
+            let unlockBtn = document.createElement('button');
+            unlockBtn.textContent = 'Разблокировать';
+            unlockBtn.style.marginLeft = '8px';
+            unlockBtn.style.background = '#fff';
+            unlockBtn.style.color = '#00bcd4';
+            unlockBtn.style.border = '1px solid #00bcd4';
+            unlockBtn.style.borderRadius = '6px';
+            unlockBtn.style.fontSize = '12px';
+            unlockBtn.style.fontWeight = '600';
+            unlockBtn.style.padding = '3px 10px';
+            unlockBtn.style.cursor = 'pointer';
+            unlockBtn.style.transition = 'all 0.2s';
+            unlockBtn.onmouseover = () => {
+                unlockBtn.style.background = '#00bcd4';
+                unlockBtn.style.color = '#fff';
+            };
+            unlockBtn.onmouseout = () => {
+                unlockBtn.style.background = '#fff';
+                unlockBtn.style.color = '#00bcd4';
+            };
+            if (btnToDisable.parentNode && btnToDisable.parentNode.style.display === 'flex') {
+                btnToDisable.parentNode.appendChild(unlockBtn);
+            } else {
+                btnToDisable.parentNode.insertBefore(unlockBtn, btnToDisable.nextSibling);
+            }
+            unlockBtn.onclick = () => {
+                btnToDisable.disabled = false;
+                btnToDisable.textContent = 'Открыть';
+                btnToDisable.style.background = 'linear-gradient(90deg, #00bcd4 80%, #fff0 100%)';
+                btnToDisable.style.color = '#fff';
+                btnToDisable.style.cursor = 'pointer';
+                btnToDisable.style.border = 'none';
+                btnToDisable.style.boxShadow = 'none';
+                btnToDisable.style.fontWeight = '600';
+                btnToDisable.style.transition = 'background 0.2s';
+                unlockBtn.remove();
+            };
+            // === Обновление общего количества часовых заданий ===
+            if (typeof hourValue === 'number' && typeof hourCount === 'number' && totalDiv) {
+                let match = totalDiv.textContent.match(/Всего часовых: (\d+)/);
+                if (match) {
+                    let totalNow = parseInt(match[1], 10);
+                    let newTotal = totalNow - hourCount;
+                    if (newTotal < 0) newTotal = 0;
+                    totalDiv.textContent = `Всего часовых: ${newTotal}   |   ` + totalDiv.textContent.split('|')[1];
+                }
+            }
+        }
+    }
+
+    // Функция для получения id задания из ссылки
+    function getJobId(row) {
+        const a = row.querySelector('.job-name');
+        if (!a) return null;
+        const match = a.href.match(/report\/(\d+)\//);
+        return match ? match[1] : null;
+    }
+
+    // Ключ для localStorage
+    const LS_KEY = 'highlighted_jobs_fail';
+
+    // Получить список подсвеченных id
+    function getHighlighted() {
+        try {
+            return JSON.parse(localStorage.getItem(LS_KEY) || '[]');
+        } catch {
+            return [];
+        }
+    }
+    function setHighlighted(arr) {
+        localStorage.setItem(LS_KEY, JSON.stringify(arr));
+    }
+
+    // Основная функция
+    function setupHighlightButtons() {
+        const highlighted = getHighlighted();
+        document.querySelectorAll('.job-table__row').forEach(row => {
+            const jobId = getJobId(row);
+            if (!jobId) return;
+
+            // Не добавлять повторно
+            if (row.querySelector('.highlight-btn-fail')) return;
+
+            // Кнопка подсветить
+            const btn = document.createElement('button');
+            btn.textContent = 'Подсветить';
+            btn.className = 'highlight-btn-fail';
+            btn.style.marginLeft = '10px';
+            btn.style.padding = '3px 10px';
+            btn.style.borderRadius = '6px';
+            btn.style.background = '#ffe082';
+            btn.style.color = '#333';
+            btn.style.border = '1px solid #ffb300';
+            btn.style.cursor = 'pointer';
+            btn.style.fontSize = '13px';
+
+            // Кнопка удалить
+            const delBtn = document.createElement('button');
+            delBtn.textContent = 'Удалить';
+            delBtn.className = 'remove-highlight-btn-fail';
+            delBtn.style.marginLeft = '10px';
+            delBtn.style.padding = '3px 10px';
+            delBtn.style.borderRadius = '6px';
+            delBtn.style.background = '#ffb3b3';
+            delBtn.style.color = '#333';
+            delBtn.style.border = '1px solid #ff3333';
+            delBtn.style.cursor = 'pointer';
+            delBtn.style.fontSize = '13px';
+            delBtn.style.display = 'none';
+
+            // Вставляем кнопки в первую ячейку
+            const firstCell = row.querySelector('.job-table__cell');
+            if (firstCell) {
+                firstCell.appendChild(btn);
+                firstCell.appendChild(delBtn);
+            }
+
+            // Если уже подсвечено — применить стиль и показать кнопку удалить
+            if (highlighted.includes(jobId)) {
+                row.style.boxShadow = '0 0 0 3px #ffe082';
+                row.style.background = '#fffde7';
+                btn.style.display = 'none';
+                delBtn.style.display = '';
+            }
+
+            // Обработчик подсветки
+            btn.onclick = () => {
+                const arr = getHighlighted();
+                if (!arr.includes(jobId)) {
+                    arr.push(jobId);
+                    setHighlighted(arr);
+                }
+                row.style.boxShadow = '0 0 0 3px #ffe082';
+                row.style.background = '#fffde7';
+                btn.style.display = 'none';
+                delBtn.style.display = '';
+            };
+
+            // Обработчик удаления
+            delBtn.onclick = () => {
+                let arr = getHighlighted();
+                arr = arr.filter(id => id !== jobId);
+                setHighlighted(arr);
+                row.style.boxShadow = '';
+                row.style.background = '';
+                btn.style.display = '';
+                delBtn.style.display = 'none';
+            };
+        });
+    }
+
+    // Запускать при загрузке и при изменении DOM (если задания могут подгружаться)
+    setupHighlightButtons();
+    const observer = new MutationObserver(setupHighlightButtons);
+    observer.observe(document.body, {childList: true, subtree: true});
+
+    // Запускать при загрузке и при изменении DOM (если задания могут подгружаться)
+    if (window.location.pathname === '/tasks/works/fail') {
+        function applyHighlightStyle(row) {
+            row.style.boxShadow = '0 0 0 4px #b800c6, 0 0 12px 2px #db64df';
+            row.style.background = '#db64df';
+            row.style.transition = 'box-shadow 0.2s, background 0.2s';
+        }
+        function removeHighlightStyle(row) {
+            row.style.boxShadow = '';
+            row.style.background = '';
+            row.style.transition = '';
+        }
+        function setupHighlightButtons() {
+            const highlighted = getHighlighted();
+            document.querySelectorAll('.job-table__row').forEach(row => {
+                const jobId = getJobId(row);
+                if (!jobId) return;
+                if (row.querySelector('.highlight-btn-fail')) return;
+                const btn = document.createElement('button');
+                btn.textContent = 'Подсветить';
+                btn.className = 'highlight-btn-fail';
+                btn.style.marginLeft = '10px';
+                btn.style.padding = '3px 10px';
+                btn.style.borderRadius = '6px';
+                btn.style.background = '#fff200';
+                btn.style.color = '#333';
+                btn.style.border = '2px solid #ffb300';
+                btn.style.cursor = 'pointer';
+                btn.style.fontSize = '13px';
+                btn.style.fontWeight = 'bold';
+                const delBtn = document.createElement('button');
+                delBtn.textContent = 'Удалить';
+                delBtn.className = 'remove-highlight-btn-fail';
+                delBtn.style.marginLeft = '10px';
+                delBtn.style.padding = '3px 10px';
+                delBtn.style.borderRadius = '6px';
+                delBtn.style.background = '#ffb3b3';
+                delBtn.style.color = '#333';
+                delBtn.style.border = '2px solid #ff3333';
+                delBtn.style.cursor = 'pointer';
+                delBtn.style.fontSize = '13px';
+                delBtn.style.fontWeight = 'bold';
+                delBtn.style.display = 'none';
+                const firstCell = row.querySelector('.job-table__cell');
+                if (firstCell) {
+                    firstCell.appendChild(btn);
+                    firstCell.appendChild(delBtn);
+                }
+                if (highlighted.includes(jobId)) {
+                    applyHighlightStyle(row);
+                    btn.style.display = 'none';
+                    delBtn.style.display = '';
+                }
+                btn.onclick = () => {
+                    const arr = getHighlighted();
+                    if (!arr.includes(jobId)) {
+                        arr.push(jobId);
+                        setHighlighted(arr);
+                    }
+                    applyHighlightStyle(row);
+                    btn.style.display = 'none';
+                    delBtn.style.display = '';
+                };
+                delBtn.onclick = () => {
+                    let arr = getHighlighted();
+                    arr = arr.filter(id => id !== jobId);
+                    setHighlighted(arr);
+                    removeHighlightStyle(row);
+                    btn.style.display = '';
+                    delBtn.style.display = 'none';
+                };
+            });
+        }
+        setupHighlightButtons();
+        const observer = new MutationObserver(setupHighlightButtons);
+        observer.observe(document.body, {childList: true, subtree: true});
+    }
+})();
