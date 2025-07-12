@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Card, Input, Select, Button, Form, Typography, Divider, Row, Col, Alert } from 'antd';
+import { Card, Select, Button, Form, Typography, Divider, Row, Col, Alert } from 'antd';
 import { CalculatorOutlined } from '@ant-design/icons';
 
 const { Option } = Select;
@@ -45,11 +45,9 @@ const ageOptions = [
 const Calculations: React.FC = () => {
     const [form] = Form.useForm();
     const [result, setResult] = useState<any>(null);
-    const [selectedItem, setSelectedItem] = useState<string>('sweater');
 
     const onFinish = (values: any) => {
         const { itemType, age } = values;
-        setSelectedItem(itemType);
 
         const itemSizes = sizeChart[itemType as keyof typeof sizeChart];
         const sizeData = itemSizes[age as keyof typeof itemSizes];
